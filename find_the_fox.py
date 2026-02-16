@@ -344,7 +344,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--burn", type=int, default=50_000, help="Burn-in steps.")
     parser.add_argument("--thin", type=int, default=50_000, help="Steps between snapshots.")
     parser.add_argument("--lazy-prob", type=float, default=0.5, help="Stay-put probability per MCMC step.")
-    parser.add_argument("--seed", type=int, default=1729, help="Random seed.")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed. If omitted, choose one at random.")
     parser.add_argument("--out-pdf", default="find_the_fox.pdf", help="Puzzle PDF output path.")
     parser.add_argument(
         "--out-key-pdf",
@@ -398,6 +398,7 @@ def validate_inputs(
 
 def main() -> None:
     args = parse_args()
+    seed = args.seed if args.seed is not None else random.SystemRandom().randrange(0, 2**32)
     try:
         spec = PuzzleSpec(
             alphabet=parse_symbols(args.alphabet),
@@ -422,7 +423,7 @@ def main() -> None:
             burn=args.burn,
             thin=args.thin,
             lazy_prob=args.lazy_prob,
-            seed=args.seed,
+            seed=seed,
             out_pdf=args.out_pdf,
             out_key_pdf=args.out_key_pdf,
             answer_key=args.answer_key,
@@ -435,6 +436,7 @@ def main() -> None:
     print(f"Wrote puzzle PDF: {args.out_pdf}")
     if args.answer_key:
         print(f"Wrote answer key PDF: {args.out_key_pdf}")
+    print(f"Seed used: {seed}")
     print(f"Target inserted on page: {result['target_page_index'] + 1}")
     print(f"Target info: {result['target_info']}")
 
