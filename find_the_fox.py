@@ -4,6 +4,8 @@ import argparse
 import random
 from collections import defaultdict
 from dataclasses import dataclass
+from typing import Optional
+
 
 from reportlab.lib.colors import black, red
 from reportlab.lib.pagesizes import letter as LETTER
@@ -14,21 +16,42 @@ CANONICAL_DIRS = ((0, 1), (1, 0), (1, 1), (1, -1))
 
 @dataclass(frozen=True)
 class PuzzleSpec:
-    """User-selected puzzle definition."""
-
     alphabet: tuple[str, ...]
     target: tuple[str, ...]
     height: int
     width: int
+    mask: Optional[tuple[str, ...]] = None   # each row: '#' active, ' ' inactive
 
     @property
     def span(self) -> int:
         return len(self.target)
 
+    @property
+    def active_cells(self) -> tuple[tuple[int, int], ...]:
+        if self.mask is None:
+            return tuple((r, c) for r in range(self.height) for c in range(self.width))
+        return tuple(
+            (r, c)
+            for r, row in enumerate(self.mask)
+            for c, ch in enumerate(row)
+            if ch != " "
+        )
+
 
 def in_bounds(spec: PuzzleSpec, r: int, c: int) -> bool:
-    """Return whether (r, c) is inside the grid."""
-    return 0 <= r < spec.height and 0 <= c < spec.width
+    if not (0 <= r < spec.height and 0 <= c < spec.width):
+        return False
+    if spec.mask is None:
+        return True
+    return spec.mask[r][c] != " "
+
+
+def initial_grid(spec: PuzzleSpec) -> list[list[str]]:
+    grid = [[" "] * spec.width for _ in range(spec.height)]
+    fill = spec.alphabet[0]
+    for r, c in spec.active_cells:
+        grid[r][c] = fill
+    return grid
 
 
 def build_segments(spec: PuzzleSpec) -> list[tuple[tuple[int, int], ...]]:
@@ -72,14 +95,30 @@ def step(grid: list[list[str]], spec: PuzzleSpec, rng: random.Random, lazy_prob:
     if rng.random() < lazy_prob:
         return
 
-    r = rng.randrange(spec.height)
-    c = rng.randrange(spec.width)
+    r, c = rng.choice(spec.active_cells)
     old = grid[r][c]
     new = rng.choice([ch for ch in spec.alphabet if ch != old])
 
     grid[r][c] = new
     if violates_local(grid, spec, r, c):
         grid[r][c] = old
+
+
+def load_mask(path: str) -> tuple[str, ...]:
+    with open(path, "r", encoding="utf-8") as f:
+        raw_lines = [line.rstrip("\n") for line in f]
+
+    while raw_lines and raw_lines[0].strip() == "":
+        raw_lines.pop(0)
+    while raw_lines and raw_lines[-1].strip() == "":
+        raw_lines.pop()
+
+    if not raw_lines:
+        raise ValueError("Mask file is empty.")
+
+    width = max(len(line) for line in raw_lines)
+    lines = tuple(line.ljust(width) for line in raw_lines)
+    return lines
 
 
 def run_chain(
@@ -93,7 +132,7 @@ def run_chain(
 ) -> list[list[str]]:
     """Sample valid background pages that avoid target/reverse entirely."""
     # Start from an obviously valid state with a single repeated symbol.
-    grid = [[spec.alphabet[0]] * spec.width for _ in range(spec.height)]
+    grid = initial_grid(spec)
     snapshots: list[list[str]] = []
 
     for t in range(1, steps + 1):
@@ -171,52 +210,142 @@ def inject_exactly_one_target(
     raise RuntimeError("Failed to inject exactly one target. Increase --max-inject-tries.")
 
 
+
+def crop_rows(rows: list[str]) -> list[str]:
+    """Remove fully blank outer rows/columns so irregular masks use the page well."""
+    if not rows:
+        return rows
+
+    top = 0
+    bottom = len(rows)
+
+    while top < bottom and rows[top].strip() == "":
+        top += 1
+    while bottom > top and rows[bottom - 1].strip() == "":
+        bottom -= 1
+
+    cropped = rows[top:bottom]
+    if not cropped:
+        return cropped
+
+    nonspace_positions = [
+        i
+        for row in cropped
+        for i, ch in enumerate(row)
+        if ch != " "
+    ]
+    if not nonspace_positions:
+        return cropped
+
+    left = min(nonspace_positions)
+    right = max(nonspace_positions)
+
+    return [row[left:right + 1] for row in cropped]
+
+
 def write_grids_pdf(
     filename: str,
     grids: list[list[str]],
     target_label: str,
     marks: list[dict[str, object] | None] | None = None,
+    show_title: bool = True,
 ) -> None:
     """Render puzzle pages and optional highlighted answer cells to a PDF."""
     doc = canvas.Canvas(filename, pagesize=LETTER)
     page_w, page_h = LETTER
-    margin_x = 72
-    margin_top = 60
-    margin_bottom = 60
-    grid_top = page_h - margin_top - 40
-    grid_bottom = margin_bottom + 30
-    avail_h = grid_top - grid_bottom
-    avail_w = page_w - 2 * margin_x
 
-    for i, rows in enumerate(grids):
+    margin_x = 54
+    margin_top = 54
+    margin_bottom = 42
+
+    for i, raw_rows in enumerate(grids):
+        rows = crop_rows(raw_rows)
+
         red_cells = set()
+        row_offset = 0
+        col_offset = 0
+
+        if raw_rows and rows:
+            # Recover how much cropping happened so highlighted cells still line up.
+            top = 0
+            bottom = len(raw_rows)
+            while top < bottom and raw_rows[top].strip() == "":
+                top += 1
+            while bottom > top and raw_rows[bottom - 1].strip() == "":
+                bottom -= 1
+
+            cropped_tmp = raw_rows[top:bottom]
+            nonspace_positions = [
+                c
+                for row in cropped_tmp
+                for c, ch in enumerate(row)
+                if ch != " "
+            ]
+            if nonspace_positions:
+                row_offset = top
+                col_offset = min(nonspace_positions)
+
         if marks is not None and marks[i] is not None:
-            red_cells = set(marks[i]["cells"])
+            red_cells = {
+                (r - row_offset, c - col_offset)
+                for (r, c) in marks[i]["cells"]
+            }
 
         n_rows = len(rows)
-        n_cols = len(rows[0]) if n_rows else 0
-        fs_h = avail_h / (n_rows * 1.35)
-        fs_w = avail_w / (n_cols * 1.30)
-        font_size = max(8, min(18, min(fs_h, fs_w) * 1.15))
+        n_cols = max((len(row) for row in rows), default=0)
+
+        # Layout box for the grid
+        title_gap = 24 if show_title else 0
+        footer_gap = 18
+        grid_top = page_h - margin_top - title_gap
+        grid_bottom = margin_bottom + footer_gap
+        avail_h = grid_top - grid_bottom
+        avail_w = page_w - 2 * margin_x
+
+        # Model actual rendered geometry
+        # Courier glyph width is roughly 0.6 * font_size.
+        char_factor = 0.60
+        tracking_factor = 0.18
+        pitch_factor = char_factor + tracking_factor
+        line_factor = 1.05
+
+        if n_rows == 0 or n_cols == 0:
+            font_size = 12
+        else:
+            fs_w = avail_w / (n_cols * pitch_factor)
+            fs_h = avail_h / (n_rows * line_factor)
+            font_size = min(fs_w, fs_h, 18)
+
+        # Let it go smaller if needed; forcing a large minimum causes clipping.
+        font_size = max(font_size, 3.5)
 
         font_name = "Courier"
         doc.setFont(font_name, font_size)
+
         char_w = doc.stringWidth("M", font_name, font_size)
-        tracking = char_w * 0.55
+        tracking = char_w * (tracking_factor / char_factor)
         pitch = char_w + tracking
-        line_h = font_size * 1.25
+        line_h = font_size * line_factor
 
-        grid_w = pitch * (n_cols - 1) + char_w
-        grid_h = line_h * (n_rows - 1) + font_size
+        grid_w = n_cols * pitch
+        grid_h = n_rows * line_h
+
         start_x = (page_w - grid_w) / 2
-        start_y = grid_bottom + (avail_h + grid_h) / 2
+        start_y = grid_bottom + (avail_h + grid_h) / 2 - line_h
 
-        doc.setFillColor(black)
-        doc.setFont("Times-Roman", 12)
-        doc.drawCentredString(page_w / 2, page_h - margin_top, f"Find exactly one {target_label}")
+        # Title
+        if show_title:
+            doc.setFillColor(black)
+            doc.setFont("Times-Roman", 12)
+            doc.drawCentredString(
+                page_w / 2,
+                page_h - margin_top,
+                f"Find exactly one {target_label}",
+            )
 
-        y = start_y
+        # Grid
         doc.setFont(font_name, font_size)
+        y = start_y
         for r, row in enumerate(rows):
             x = start_x
             for c, ch in enumerate(row):
@@ -225,13 +354,14 @@ def write_grids_pdf(
                 x += pitch
             y -= line_h
 
+        # Page number
         doc.setFillColor(black)
         doc.setFont("Times-Roman", 10)
         doc.drawCentredString(page_w / 2, margin_bottom / 2, str(i + 1))
+
         doc.showPage()
 
     doc.save()
-
 
 def make_book(
     spec: PuzzleSpec,
@@ -246,6 +376,7 @@ def make_book(
     answer_key: bool,
     fox_page: int | None,
     max_inject_tries: int,
+    show_title: bool = True
 ) -> dict[str, object]:
     """Generate pages, inject target on one page, and write output PDFs."""
     rng = random.Random(seed)
@@ -294,12 +425,24 @@ def make_book(
     pages_with_target[page_index] = ["".join(row) for row in injected]
     target_label = "".join(spec.target)
 
-    write_grids_pdf(filename=out_pdf, grids=pages_with_target, target_label=target_label, marks=[None] * n_pages)
+    # write_grids_pdf(filename=out_pdf, grids=pages_with_target, target_label=target_label, marks=[None] * n_pages)
+    write_grids_pdf(
+        filename=out_pdf,
+        grids=pages_with_target,
+        target_label=target_label,
+        marks=[None] * n_pages,
+        show_title=show_title)
 
     if answer_key:
         marks = [None] * n_pages
         marks[page_index] = info
-        write_grids_pdf(filename=out_key_pdf, grids=pages_with_target, target_label=target_label, marks=marks)
+        write_grids_pdf(
+            filename=out_key_pdf,
+            grids=pages_with_target,
+            target_label=target_label,
+            marks=marks,
+            show_title=show_title,
+        )
 
     return {"target_page_index": page_index, "target_info": info}
 
@@ -345,7 +488,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--thin", type=int, default=50_000, help="Steps between snapshots.")
     parser.add_argument("--lazy-prob", type=float, default=0.5, help="Stay-put probability per MCMC step.")
     parser.add_argument("--seed", type=int, default=None, help="Random seed. If omitted, choose one at random.")
+    parser.add_argument("--mask-file", default=None, help="Optional text file mask; non-space = active cell.")
     parser.add_argument("--out-pdf", default="find_the_fox.pdf", help="Puzzle PDF output path.")
+    parser.add_argument("--no-title", action="store_true", help="Omit page title.")
     parser.add_argument(
         "--out-key-pdf",
         default="find_the_fox_answer_key.pdf",
@@ -400,12 +545,15 @@ def main() -> None:
     args = parse_args()
     seed = args.seed if args.seed is not None else random.SystemRandom().randrange(0, 2**32)
     try:
+        mask = load_mask(args.mask_file) if args.mask_file is not None else None
+
         spec = PuzzleSpec(
             alphabet=parse_symbols(args.alphabet),
             target=parse_word(args.target),
-            height=args.height,
-            width=args.width,
-        )
+            height=(len(mask) if mask is not None else args.height),
+            width=(len(mask[0]) if mask is not None else args.width),
+            mask=mask,
+)
         validate_inputs(
             spec=spec,
             n_pages=args.pages,
@@ -429,6 +577,7 @@ def main() -> None:
             answer_key=args.answer_key,
             fox_page=args.fox_page,
             max_inject_tries=args.max_inject_tries,
+            show_title=not args.no_title,
         )
     except (ValueError, RuntimeError) as exc:
         raise SystemExit(f"Error: {exc}") from exc
